@@ -32,3 +32,10 @@ gen
 
 # Sentry Config File
 .env.sentry-build-plugin
+
+# Nix/Devenv
+.devenv*
+devenv.local.nix
+.direnv
+result
+result-*

@@ -312,6 +312,10 @@ impl TerminalHandler {
                 }
             });
 
+            pty.wait_for_shell_ready()
+                .await
+                .map_err(|e| format!("Shell readiness check failed: {}", e))?;
+
             Box::new(pty)
         };
 

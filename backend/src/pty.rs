@@ -1,14 +1,18 @@
-use std::{
-    collections::HashMap,
-    io::Write,
-    sync::{Arc, Mutex},
-};
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use eyre::{eyre, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    io::Write,
+    sync::{Arc, Mutex},
+};
+use sysinfo::{Pid, ProcessesToUpdate, System};
+use tokio::{
+    task::spawn_blocking,
+    time::{sleep, Duration, Instant},
+};
 use ts_rs::TS;
 use uuid::Uuid;
 
@@ -161,6 +165,116 @@ impl Pty {
         let bytes = Bytes::from(bytes);
 
         self.send_bytes(bytes).await
+    }
+
+    pub async fn wait_for_shell_ready(&self) -> Result<()> {
+        const REQUIRED_READY_CHECKS: i32 = 3;
+        let start = Instant::now();
+        let mut consecutive_ready_checks = 0;
+
+        // Wait for shell to be ready by checking that it has no active child processes
+        // When a shell is at a prompt, it typically has no children running
+        let shell_pid = {
+            match self.child.lock() {
+                Ok(child) => match child.process_id() {
+                    Some(pid) => pid,
+                    None => return Err(eyre!("Unable to get shell process ID")),
+                },
+                Err(e) => return Err(eyre!("Failed to lock child process: {}", e)),
+            }
+        };
+
+        loop {
+            if start.elapsed() > Duration::from_secs(5) {
+                log::warn!("Shell readiness check timed out after 5 seconds, proceeding anyway");
+                return Ok(());
+            }
+
+            // Check if shell process is still running
+            let is_running = {
+                match self.child.lock() {
+                    Ok(mut child) => {
+                        match child.try_wait() {
+                            Ok(Some(exit_status)) => {
+                                return Err(eyre!(
+                                    "Shell process exited during startup: {:?}",
+                                    exit_status
+                                ));
+                            }
+                            Ok(None) => true, // Process is still running
+                            Err(e) => {
+                                return Err(eyre!("Failed to check child process status: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(eyre!("Failed to lock child process: {}", e));
+                    }
+                }
+            };
+
+            if is_running {
+                // Process is still running, check if it has children
+                if self.shell_has_no_children(shell_pid).await? {
+                    consecutive_ready_checks += 1;
+                    if consecutive_ready_checks >= REQUIRED_READY_CHECKS {
+                        log::debug!(
+                            "Shell ready after {:.2}s (no child processes)",
+                            start.elapsed().as_secs_f64()
+                        );
+                        return Ok(());
+                    }
+                } else {
+                    // Shell is still initializing (has child processes)
+                    consecutive_ready_checks = 0;
+                }
+            }
+
+            // Small delay between checks
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    async fn shell_has_no_children(&self, shell_pid: u32) -> Result<bool> {
+        spawn_blocking(move || {
+            let mut sys = System::new();
+            sys.refresh_processes(ProcessesToUpdate::All, true);
+
+            let shell_pid = Pid::from_u32(shell_pid);
+            let mut child_pids = Vec::new();
+
+            // Find all processes that are children of the shell
+            sys.processes().iter().for_each(|(pid, process)| {
+                if let Some(parent_pid) = process.parent() {
+                    if parent_pid == shell_pid {
+                        child_pids.push(pid.as_u32());
+                    }
+                }
+            });
+
+            if !child_pids.is_empty() {
+                // Shell has child processes, not ready yet
+                log::debug!(
+                    "Shell PID {} has children: {}",
+                    shell_pid.as_u32(),
+                    child_pids
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                Ok(false)
+            } else {
+                // No child processes found, shell is ready
+                log::debug!(
+                    "Shell ready after {} s (no child processes)",
+                    shell_pid.as_u32()
+                );
+                Ok(true)
+            }
+        })
+        .await
+        .map_err(|e| eyre!("Task join error: {}", e))?
     }
 
     #[allow(dead_code)]

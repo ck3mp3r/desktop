@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use eyre::Result;
@@ -59,6 +60,15 @@ pub async fn pty_open(
             return Err(format!("Failed to open terminal: {e}"));
         }
     };
+
+    // Wait for shell to be ready before proceeding
+    if let Err(e) = pty.wait_for_shell_ready().await {
+        log::warn!("Shell readiness check failed: {}", e);
+        // Continue anyway to avoid breaking existing functionality
+    }
+
+    // Add a small delay after readiness check to ensure shell is fully ready
+    sleep(Duration::from_millis(500)).await;
 
     let reader = pty.reader.clone();
     let app_inner = app.clone();
